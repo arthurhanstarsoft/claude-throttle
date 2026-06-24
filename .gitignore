@@ -1,0 +1,16 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# Local-only artifacts — never commit these.
+# (The tool's real runtime state lives under $HOME, not here, but ignore any
+#  stray copies someone might drop in the repo.)
+*.log
+config.local.sh
+settings.json
+settings.json.bak
+
+# If you keep personal notes or scratch files in the repo
+/scratch/
+/.local/

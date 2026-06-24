@@ -67,10 +67,12 @@ if [ "${CT_PRESTART_WAIT:-1}" = "1" ]; then
 fi
 
 # ---- acquire a slot ---------------------------------------------------------
-N="${CT_MAX_CONCURRENCY:-2}"
 deadline=$(( $(LC_ALL=C date +%s) + ${CT_ACQUIRE_TIMEOUT:-300} ))
 
 while :; do
+  # Recompute the limit each pass so it tracks current free memory: if RAM frees
+  # up while we wait, more slots open; if it tightens, fewer new commands start.
+  N="$(ct_effective_concurrency)"
   i=1
   while [ "$i" -le "$N" ]; do
     slot="$CT_SLOTS_DIR/slot.$i.lock"

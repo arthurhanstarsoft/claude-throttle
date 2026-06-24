@@ -32,6 +32,12 @@ CT_WATCHDOG_LOG="$CT_STATE_DIR/watchdog.log"
 CT_WATCHDOG_PID="$CT_STATE_DIR/watchdog.pid"
 CT_PAUSED_LIST="$CT_STATE_DIR/paused.list"
 
+# Where `install` copies the tool to run from. It must NOT be a macOS
+# TCC-protected folder (~/Documents, ~/Desktop, ~/Downloads): a launchd agent
+# cannot execute code from those. ~/.local/share is safe and stable.
+CT_INSTALL_DIR="${CT_INSTALL_DIR:-$HOME/.local/share/claude-throttle}"
+CT_INSTALL_BIN="$CT_INSTALL_DIR/bin/claude-throttle"
+
 CT_BIN="$HOME/.local/bin/claude-throttle"
 CT_SETTINGS="$HOME/.claude/settings.json"
 CT_PLIST_LABEL="com.user.claude-throttle.watchdog"
@@ -46,7 +52,19 @@ CT_CONFIG_EXAMPLE="$CT_ROOT/share/config.example.sh"
 : "${CT_ENABLED:=1}"
 : "${CT_GATE_MODE:=heavy}"
 : "${CT_HEAVY_REGEX:=(pnpm|npm|yarn|bun|tsc|webpack|vite|jest|vitest|build|test|install|cargo|make|gradle|xcodebuild|docker)}"
-: "${CT_MAX_CONCURRENCY:=2}"
+# Commands that run indefinitely (dev servers, file watchers). These are NEVER
+# throttled: they'd hold a concurrency slot forever and starve real work. They
+# idle most of the time, and the watchdog still protects against a runaway one.
+: "${CT_LONGRUN_REGEX:=(--watch|[[:space:]]-w([[:space:]]|$)|[[:space:]]watch([[:space:]]|$)|run (dev|start|serve)|[[:space:]]dev([[:space:]]|$)|[[:space:]]serve([[:space:]]|$)|nodemon|next dev|nuxt dev|ng serve|rails (s|server)|artisan serve|flask run|uvicorn|gunicorn|storybook|http-server|live-server)}"
+: "${CT_BYPASS_PERMISSIONS:=0}"
+# Concurrency. With CT_DYNAMIC=1 the live limit scales with free RAM between
+# CT_MIN_CONCURRENCY and CT_MAX_CONCURRENCY (~one slot per CT_MEM_PER_SLOT_MB of
+# free memory), capped at the CPU core count. CT_MAX_CONCURRENCY is the ceiling.
+: "${CT_DYNAMIC:=1}"
+: "${CT_MAX_CONCURRENCY:=6}"
+: "${CT_MIN_CONCURRENCY:=1}"
+: "${CT_MEM_PER_SLOT_MB:=1500}"
+: "${CT_FALLBACK_CONCURRENCY:=2}"
 : "${CT_ACQUIRE_TIMEOUT:=300}"
 : "${CT_POLL:=0.3}"
 : "${CT_NICE:=10}"
@@ -110,6 +128,43 @@ ct_load1_x100() {
 
 ct_cores() { LC_ALL=C sysctl -n hw.logicalcpu 2>/dev/null || echo 1; }
 
+# Total physical RAM in MB.
+ct_total_mem_mb() {
+  local b; b="$(LC_ALL=C sysctl -n hw.memsize 2>/dev/null)" || return 0
+  [ -n "$b" ] && printf '%d' "$(( b / 1048576 ))"
+}
+
+# Approximate free system memory in MB (free% of total). Echoes "" on failure.
+ct_free_mb() {
+  local pct total; pct="$(ct_free_pct)"; total="$(ct_total_mem_mb)"
+  [ -n "$pct" ] && [ -n "$total" ] || return 0
+  printf '%d' "$(( pct * total / 100 ))"
+}
+
+# How many heavy commands to allow concurrently RIGHT NOW.
+# When CT_DYNAMIC=1, this scales with free memory: roughly one slot per
+# CT_MEM_PER_SLOT_MB of free RAM, clamped to [CT_MIN_CONCURRENCY,
+# CT_MAX_CONCURRENCY] and never above the CPU core count. Falls back to a fixed
+# value when dynamic is off or memory can't be read.
+ct_effective_concurrency() {
+  local maxc minc
+  maxc="${CT_MAX_CONCURRENCY:-6}"; minc="${CT_MIN_CONCURRENCY:-1}"
+  if [ "${CT_DYNAMIC:-1}" != "1" ]; then
+    printf '%d' "$maxc"; return 0
+  fi
+  local free per n cores
+  free="$(ct_free_mb)"; per="${CT_MEM_PER_SLOT_MB:-1500}"
+  if [ -z "$free" ] || [ "$per" -le 0 ] 2>/dev/null; then
+    printf '%d' "${CT_FALLBACK_CONCURRENCY:-2}"; return 0   # can't measure -> safe middle
+  fi
+  n=$(( (free + per / 2) / per ))   # round to nearest, not floor
+  cores="$(ct_cores)"
+  [ "$n" -gt "$cores" ] 2>/dev/null && n="$cores"   # don't oversubscribe CPUs
+  [ "$n" -gt "$maxc" ] 2>/dev/null && n="$maxc"      # ceiling
+  [ "$n" -lt "$minc" ] 2>/dev/null && n="$minc"      # floor (>=1 so work never fully stalls)
+  printf '%d' "$n"
+}
+
 # ---- process tree: claude descendants ---------------------------------------
 # Echo the PIDs of every claude process (the anchors) on this user's session.
 # CT_ANCHOR_OVERRIDE (space-separated PIDs) forces a specific anchor set; used
@@ -119,46 +174,45 @@ ct_claude_anchors() {
     printf '%s\n' $CT_ANCHOR_OVERRIDE | LC_ALL=C sort -u
     return 0
   fi
-  { pgrep -x claude 2>/dev/null
-    pgrep -f '/\.local/bin/claude$' 2>/dev/null
-  } | LC_ALL=C sort -u
+  # Claude may appear in ps with comm == "claude" OR comm == a full path ending
+  # in "/claude" (depends on how it was launched). Match either by basename,
+  # while never matching "claude-throttle" (our own processes).
+  LC_ALL=C ps -axo pid=,comm= 2>/dev/null | LC_ALL=C awk '
+    {
+      pid=$1; $1=""; sub(/^ /,""); comm=$0
+      n=split(comm, parts, "/"); base=parts[n]
+      if (base=="claude") print pid
+    }' | LC_ALL=C sort -u
 }
 
 # Echo all PIDs that descend from any claude anchor (excluding the anchors
-# themselves). Pure-bash BFS over the pid/ppid map — no external recursion.
+# themselves), one per line. Implemented in awk: it tolerates ps's leading/
+# repeated whitespace and any number of anchors (the previous bash version broke
+# on both), and does a proper BFS over the pid/ppid map.
 ct_claude_descendants() {
   local anchors
-  anchors="$(ct_claude_anchors)"
+  anchors="$(ct_claude_anchors | tr '\n' ' ')"
   [ -z "$anchors" ] && return 0
 
-  # Build "pid ppid" lines once.
-  local map
-  map="$(LC_ALL=C ps -axo pid=,ppid= 2>/dev/null)"
-  [ -z "$map" ] && return 0
-
-  # frontier = anchors; expand level by level.
-  local frontier="$anchors" seen="" next pid ppid line
-  while [ -n "$frontier" ]; do
-    next=""
-    while IFS= read -r line; do
-      [ -z "$line" ] && continue
-      pid="${line%% *}"
-      ppid="${line##* }"
-      # is ppid in the current frontier?
-      case " $frontier " in
-        *" $ppid "*)
-          # avoid revisiting
-          case " $seen " in
-            *" $pid "*) : ;;
-            *) seen="$seen $pid"; next="$next $pid" ;;
-          esac
-          ;;
-      esac
-    done <<EOF
-$map
-EOF
-    frontier="$next"
-  done
-  # emit, trimmed, one per line
-  printf '%s\n' $seen
+  LC_ALL=C ps -axo pid=,ppid= 2>/dev/null | LC_ALL=C awk -v anchors="$anchors" '
+    BEGIN {
+      n = split(anchors, a, " ")
+      for (i = 1; i <= n; i++) if (a[i] != "") is_anchor[a[i]] = 1
+    }
+    { kids[$2] = kids[$2] " " $1 }     # $1=pid $2=ppid; awk splits on any whitespace
+    END {
+      qn = 0
+      for (p in is_anchor) queue[qn++] = p
+      head = 0
+      while (head < qn) {
+        cur = queue[head++]
+        m = split(kids[cur], k, " ")
+        for (i = 1; i <= m; i++) {
+          if (k[i] == "" || (k[i] in seen) || (k[i] in is_anchor)) continue
+          seen[k[i]] = 1
+          queue[qn++] = k[i]
+          print k[i]
+        }
+      }
+    }'
 }

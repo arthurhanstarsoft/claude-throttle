@@ -34,6 +34,17 @@ case "$cmd" in
   *"claude-throttle run "*) allow_unchanged ;;
 esac
 
+# Don't throttle commands Claude runs in the background — they're meant to keep
+# running and would hold a concurrency slot for their whole (open-ended) life.
+bg="$(printf '%s' "$input" | jq -r '.tool_input.run_in_background // false' 2>/dev/null)"
+[ "$bg" = "true" ] && { ct_tlog "HOOK skip (background): $cmd"; allow_unchanged; }
+
+# Don't throttle long-running dev servers / file watchers, for the same reason.
+if printf '%s' "$cmd" | LC_ALL=C grep -Eq "$CT_LONGRUN_REGEX"; then
+  ct_tlog "HOOK skip (long-running): $cmd"
+  allow_unchanged
+fi
+
 # Gate: in "heavy" mode only wrap resource-intensive commands.
 if [ "${CT_GATE_MODE:-heavy}" = "heavy" ]; then
   if ! printf '%s' "$cmd" | LC_ALL=C grep -Eq "$CT_HEAVY_REGEX"; then
@@ -53,13 +64,27 @@ fi
 wrapped="$(jq -rn --arg r "$runner" --arg c "$cmd" '$r + " run -- " + ($c|@sh)')"
 [ -n "$wrapped" ] || allow_unchanged
 
-jq -cn --arg c "$wrapped" '{
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "allow",
-    updatedInput: { command: $c }
-  }
-}' 2>/dev/null || allow_unchanged
+# Emit the rewrite. By default we DO NOT set permissionDecision, so Claude's
+# normal permission flow (your allow/deny rules and prompts) still applies — the
+# throttle no longer silently auto-approves heavy commands. Set
+# CT_BYPASS_PERMISSIONS=1 to restore the old "auto-approve wrapped commands"
+# behavior (skips the prompt).
+if [ "${CT_BYPASS_PERMISSIONS:-0}" = "1" ]; then
+  jq -cn --arg c "$wrapped" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      updatedInput: { command: $c }
+    }
+  }' 2>/dev/null || allow_unchanged
+else
+  jq -cn --arg c "$wrapped" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      updatedInput: { command: $c }
+    }
+  }' 2>/dev/null || allow_unchanged
+fi
 
 ct_tlog "HOOK wrapped: $cmd"
 exit 0

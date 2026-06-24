@@ -8,11 +8,23 @@
 #   status               show live throttle/watchdog state
 #   doctor               check environment + config, report problems
 #   install              install hook + watchdog on this machine
+#   update               re-copy latest code from your repo + reload (keeps config)
 #   uninstall            remove everything (keeps config/logs)
 #   help                 show this help
 
 set +e
-_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve our own path through any symlinks (we're symlinked onto PATH at
+# install time, and bash leaves BASH_SOURCE as the symlink). Without this,
+# locating libexec/ relative to the symlink dir (~/.local/bin) would fail.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _link="$(readlink "$_self")"
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$(cd "$(dirname "$_self")" && pwd)/$_link" ;;
+  esac
+done
+_here="$(cd "$(dirname "$_self")" && pwd)"
 CT_ROOT="$(cd "$_here/.." && pwd)"
 LIBEXEC="$CT_ROOT/libexec"
 
@@ -58,8 +70,15 @@ do_doctor() {
   have shlock && ok "shlock present" || warn "shlock absent (watchdog uses pidfile fallback)"
   echo
   echo "Configuration:"
-  printf '  enabled=%s gate=%s concurrency=%s nice=%s cpulimit=%s\n' \
-    "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY" "$CT_NICE" "$CT_USE_CPULIMIT"
+  if [ "${CT_DYNAMIC:-1}" = "1" ]; then
+    printf '  enabled=%s gate=%s concurrency=dynamic[%s..%s] now=%s nice=%s cpulimit=%s\n' \
+      "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MIN_CONCURRENCY" "$CT_MAX_CONCURRENCY" \
+      "$(ct_effective_concurrency)" "$CT_NICE" "$CT_USE_CPULIMIT"
+    printf '  (~1 slot per %sMB free RAM, capped at %s cores)\n' "$CT_MEM_PER_SLOT_MB" "$(ct_cores)"
+  else
+    printf '  enabled=%s gate=%s concurrency=fixed:%s nice=%s cpulimit=%s\n' \
+      "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY" "$CT_NICE" "$CT_USE_CPULIMIT"
+  fi
   printf '  watchdog: interval=%ss crit_free=%s%% resume_free=%s%% pause_count=%s rss_floor=%sMB\n' \
     "$CT_WATCHDOG_INTERVAL" "$CT_CRIT_FREE_PCT" "$CT_RESUME_FREE_PCT" "$CT_PAUSE_COUNT" "$CT_MIN_PAUSE_RSS_MB"
   [ -f "$CT_CONFIG_FILE" ] && ok "config file present" || warn "no config file — using built-in defaults"
@@ -77,8 +96,13 @@ do_doctor() {
 
 # ---- status -----------------------------------------------------------------
 do_status() {
-  printf 'enabled=%s gate=%s concurrency=%s\n' "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY"
-  printf 'free_mem=%s%% load1x100=%s\n' "$(ct_free_pct)" "$(ct_load1_x100)"
+  if [ "${CT_DYNAMIC:-1}" = "1" ]; then
+    printf 'enabled=%s gate=%s concurrency=dynamic now=%s (range %s..%s)\n' \
+      "$CT_ENABLED" "$CT_GATE_MODE" "$(ct_effective_concurrency)" "$CT_MIN_CONCURRENCY" "$CT_MAX_CONCURRENCY"
+  else
+    printf 'enabled=%s gate=%s concurrency=fixed:%s\n' "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY"
+  fi
+  printf 'free_mem=%s%% (~%sMB) load1x100=%s\n' "$(ct_free_pct)" "$(ct_free_mb)" "$(ct_load1_x100)"
   if watchdog_running; then
     echo "watchdog: RUNNING (pid $(cat "$CT_WATCHDOG_PID"))"
   else
@@ -104,9 +128,23 @@ do_install() {
     warn "config already exists, keeping it: $CT_CONFIG_FILE"
   fi
 
-  # 2. executables + symlink onto PATH
-  chmod +x "$CT_ROOT/bin/claude-throttle" "$LIBEXEC"/*.sh 2>/dev/null
-  ln -sf "$CT_ROOT/bin/claude-throttle" "$CT_BIN" && ok "symlinked $CT_BIN"
+  # 2. copy the tool to a stable, non-TCC-protected location and symlink it.
+  #    macOS blocks launchd agents from executing code under ~/Documents etc.,
+  #    so we never run from the repo checkout — we run from $CT_INSTALL_DIR.
+  if [ "$CT_ROOT" = "$CT_INSTALL_DIR" ]; then
+    warn "running from install dir already; refreshing in place"
+  else
+    rm -rf "$CT_INSTALL_DIR" 2>/dev/null
+    mkdir -p "$CT_INSTALL_DIR"
+    cp -R "$CT_ROOT/bin" "$CT_ROOT/libexec" "$CT_ROOT/share" "$CT_INSTALL_DIR/" \
+      && ok "copied tool to $CT_INSTALL_DIR" \
+      || bad "failed to copy tool to $CT_INSTALL_DIR"
+    # Remember where we were installed from so `claude-throttle update` can
+    # re-copy the latest code from your repo, from anywhere.
+    printf '%s\n' "$CT_ROOT" >"$CT_STATE_DIR/source_path" 2>/dev/null
+  fi
+  chmod +x "$CT_INSTALL_BIN" "$CT_INSTALL_DIR/libexec"/*.sh 2>/dev/null
+  ln -sf "$CT_INSTALL_BIN" "$CT_BIN" && ok "symlinked $CT_BIN -> $CT_INSTALL_BIN"
   case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) warn "$HOME/.local/bin is not on your PATH — add it" ;; esac
 
   # 3. merge PreToolUse hook into settings.json
@@ -129,11 +167,16 @@ do_install() {
       || { rm -f "$tmp"; bad "failed to update $CT_SETTINGS"; }
   fi
 
-  # 4. render + load the watchdog LaunchAgent
+  # 4. render + load the watchdog LaunchAgent (point it at the installed copy,
+  #    an absolute non-protected path — never the ~/.local/bin symlink or repo).
   local tmp="$CT_PLIST.tmp.$$"
-  sed -e "s#__CT_BIN__#$CT_BIN#g" -e "s#__CT_WATCHDOG_LOG__#$CT_WATCHDOG_LOG#g" \
-      "$CT_PLIST_TEMPLATE" >"$tmp" && mv "$tmp" "$CT_PLIST" && ok "wrote $CT_PLIST"
+  sed -e "s#__CT_BIN__#$CT_INSTALL_BIN#g" -e "s#__CT_WATCHDOG_LOG__#$CT_WATCHDOG_LOG#g" \
+      "$CT_INSTALL_DIR/share/$CT_PLIST_LABEL.plist.template" >"$tmp" \
+      && mv "$tmp" "$CT_PLIST" && ok "wrote $CT_PLIST"
+  # Unload any previous instance, then wait briefly — bootout is asynchronous and
+  # an immediate bootstrap can race it and silently fail to (re)load the job.
   launchctl bootout "gui/$(id -u)/$CT_PLIST_LABEL" >/dev/null 2>&1
+  sleep 1
   if launchctl bootstrap "gui/$(id -u)" "$CT_PLIST" >/dev/null 2>&1; then
     ok "watchdog loaded (launchctl bootstrap)"
   elif launchctl load -w "$CT_PLIST" >/dev/null 2>&1; then
@@ -141,11 +184,41 @@ do_install() {
   else
     warn "could not load watchdog via launchctl — start manually: claude-throttle watchdog &"
   fi
+  # Confirm it actually came up; report honestly if not.
+  sleep 1
+  if [ -f "$CT_WATCHDOG_PID" ] && kill -0 "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null; then
+    ok "watchdog is running (pid $(cat "$CT_WATCHDOG_PID"))"
+  else
+    warn "watchdog did not report running yet — check: claude-throttle status"
+  fi
 
   echo
   do_doctor
   echo
   echo "Done. Restart Claude Code so it picks up the new hook."
+}
+
+# ---- update -----------------------------------------------------------------
+# Re-copy the latest code from your repo checkout and reload the watchdog,
+# preserving your config. Works from anywhere: if invoked as the installed copy,
+# it finds your repo via the saved source_path.
+do_update() {
+  # Case A: invoked from a repo checkout (e.g. ./update.sh) -> install directly.
+  if [ "$CT_ROOT" != "$CT_INSTALL_DIR" ] && [ -x "$CT_ROOT/bin/claude-throttle" ]; then
+    echo "Updating claude-throttle from $CT_ROOT …"
+    do_install
+    return
+  fi
+  # Case B: invoked as the installed copy -> jump to the saved source repo.
+  local src; src="$(cat "$CT_STATE_DIR/source_path" 2>/dev/null)"
+  if [ -n "$src" ] && [ -x "$src/bin/claude-throttle" ]; then
+    echo "Updating claude-throttle from $src …"
+    exec bash "$src/bin/claude-throttle" install
+  fi
+  bad "Can't find your source repo to update from."
+  echo "Run ./update.sh from your claude-throttle checkout once; after that," >&2
+  echo "'claude-throttle update' will work from anywhere." >&2
+  return 1
 }
 
 # ---- uninstall --------------------------------------------------------------
@@ -174,8 +247,11 @@ do_uninstall() {
       || { rm -f "$tmp"; warn "could not edit $CT_SETTINGS"; }
   fi
 
-  # remove symlink
+  # remove symlink + installed copy
   [ -L "$CT_BIN" ] && rm -f "$CT_BIN" && ok "removed $CT_BIN"
+  if [ "$CT_ROOT" != "$CT_INSTALL_DIR" ] && [ -d "$CT_INSTALL_DIR" ]; then
+    rm -rf "$CT_INSTALL_DIR" && ok "removed $CT_INSTALL_DIR"
+  fi
   warn "kept config ($CT_CONFIG_DIR) and logs ($CT_STATE_DIR) — delete manually if desired"
   echo "Done. Restart Claude Code."
 }
@@ -184,6 +260,7 @@ case "$cmd" in
   doctor)    do_doctor ;;
   status)    do_status ;;
   install)   do_install ;;
+  update)     do_update ;;
   uninstall) do_uninstall ;;
   help|--help|-h|"")
     grep -E '^#( |$)' "$_here/claude-throttle" | sed -E 's/^# ?//' | sed -n '1,20p' ;;

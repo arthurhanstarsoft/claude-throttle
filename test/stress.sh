@@ -17,6 +17,7 @@ HOLD="${HOLD:-2}"      # seconds each fake command "works"
 work="$(mktemp -d "${TMPDIR:-/tmp}/ct-stress.XXXXXX")"
 export CT_STATE_DIR="$work/state"
 export CT_CONFIG_FILE="$work/none.sh"     # force built-in defaults
+export CT_DYNAMIC=0                        # fixed cap so the assertion is deterministic
 export CT_MAX_CONCURRENCY="$N"
 export CT_ACQUIRE_TIMEOUT=60
 export CT_PRESTART_WAIT=0                  # don't gate on real memory during the test
