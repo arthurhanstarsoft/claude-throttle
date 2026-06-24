@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# claude-throttle — single entry point.
+#
+# Subcommands:
+#   hook                 PreToolUse hook (reads JSON on stdin)         [internal]
+#   run -- <cmd>         run <cmd> under a concurrency slot            [internal]
+#   watchdog             Layer-2 memory watchdog loop                  [internal]
+#   status               show live throttle/watchdog state
+#   doctor               check environment + config, report problems
+#   install              install hook + watchdog on this machine
+#   uninstall            remove everything (keeps config/logs)
+#   help                 show this help
+
+set +e
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CT_ROOT="$(cd "$_here/.." && pwd)"
+LIBEXEC="$CT_ROOT/libexec"
+
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+
+case "$cmd" in
+  hook)     exec bash "$LIBEXEC/hook-pretooluse.sh" "$@" ;;
+  run)      exec bash "$LIBEXEC/wrapper.sh" "$@" ;;
+  watchdog) exec bash "$LIBEXEC/watchdog.sh" "$@" ;;
+esac
+
+# Non-internal subcommands need the shared helpers.
+# shellcheck source=/dev/null
+. "$LIBEXEC/common.sh"
+
+# ---- helpers ----------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+
+watchdog_running() {
+  [ -f "$CT_WATCHDOG_PID" ] && kill -0 "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
+}
+
+hook_installed() {
+  have jq && [ -f "$CT_SETTINGS" ] && \
+    jq -e '.hooks.PreToolUse[]?.hooks[]?.command | select(test("claude-throttle hook"))' \
+       "$CT_SETTINGS" >/dev/null 2>&1
+}
+
+# ---- doctor -----------------------------------------------------------------
+do_doctor() {
+  echo "claude-throttle doctor"
+  echo "  root:   $CT_ROOT"
+  echo "  config: $CT_CONFIG_FILE"
+  echo "  state:  $CT_STATE_DIR"
+  echo
+  echo "Dependencies:"
+  [ -x /usr/bin/lockf ] && ok "lockf present (/usr/bin/lockf)" || bad "lockf MISSING — semaphore falls back to unthrottled"
+  have jq && ok "jq present" || bad "jq MISSING — hook will fail open (no throttling)"
+  have cpulimit && ok "cpulimit present" || warn "cpulimit absent (optional; \`brew install cpulimit\` to enable CT_USE_CPULIMIT)"
+  have shlock && ok "shlock present" || warn "shlock absent (watchdog uses pidfile fallback)"
+  echo
+  echo "Configuration:"
+  printf '  enabled=%s gate=%s concurrency=%s nice=%s cpulimit=%s\n' \
+    "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY" "$CT_NICE" "$CT_USE_CPULIMIT"
+  printf '  watchdog: interval=%ss crit_free=%s%% resume_free=%s%% pause_count=%s rss_floor=%sMB\n' \
+    "$CT_WATCHDOG_INTERVAL" "$CT_CRIT_FREE_PCT" "$CT_RESUME_FREE_PCT" "$CT_PAUSE_COUNT" "$CT_MIN_PAUSE_RSS_MB"
+  [ -f "$CT_CONFIG_FILE" ] && ok "config file present" || warn "no config file — using built-in defaults"
+  echo
+  echo "Installation:"
+  [ -L "$CT_BIN" ] || [ -x "$CT_BIN" ] && ok "CLI on PATH ($CT_BIN)" || warn "CLI not symlinked to $CT_BIN"
+  hook_installed && ok "PreToolUse hook installed in $CT_SETTINGS" || warn "hook NOT installed (run: claude-throttle install)"
+  [ -f "$CT_PLIST" ] && ok "LaunchAgent plist present" || warn "watchdog plist not installed"
+  watchdog_running && ok "watchdog running (pid $(cat "$CT_WATCHDOG_PID"))" || warn "watchdog not running"
+  echo
+  echo "Live metrics:"
+  printf '  free memory: %s%%   load1x100: %s   cores: %s\n' \
+    "$(ct_free_pct)" "$(ct_load1_x100)" "$(ct_cores)"
+}
+
+# ---- status -----------------------------------------------------------------
+do_status() {
+  printf 'enabled=%s gate=%s concurrency=%s\n' "$CT_ENABLED" "$CT_GATE_MODE" "$CT_MAX_CONCURRENCY"
+  printf 'free_mem=%s%% load1x100=%s\n' "$(ct_free_pct)" "$(ct_load1_x100)"
+  if watchdog_running; then
+    echo "watchdog: RUNNING (pid $(cat "$CT_WATCHDOG_PID"))"
+  else
+    echo "watchdog: stopped"
+  fi
+  local n=0
+  [ -s "$CT_PAUSED_LIST" ] && n="$(grep -c . "$CT_PAUSED_LIST" 2>/dev/null)"
+  echo "currently paused: $n process(es)"
+  local d; d="$(ct_claude_descendants | grep -c . 2>/dev/null)"
+  echo "claude descendants: ${d:-0}"
+}
+
+# ---- install ----------------------------------------------------------------
+do_install() {
+  echo "Installing claude-throttle…"
+  ct_ensure_dirs
+  mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.claude" 2>/dev/null
+
+  # 1. seed config
+  if [ ! -f "$CT_CONFIG_FILE" ]; then
+    cp "$CT_CONFIG_EXAMPLE" "$CT_CONFIG_FILE" && ok "wrote $CT_CONFIG_FILE"
+  else
+    warn "config already exists, keeping it: $CT_CONFIG_FILE"
+  fi
+
+  # 2. executables + symlink onto PATH
+  chmod +x "$CT_ROOT/bin/claude-throttle" "$LIBEXEC"/*.sh 2>/dev/null
+  ln -sf "$CT_ROOT/bin/claude-throttle" "$CT_BIN" && ok "symlinked $CT_BIN"
+  case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) warn "$HOME/.local/bin is not on your PATH — add it" ;; esac
+
+  # 3. merge PreToolUse hook into settings.json
+  if ! have jq; then
+    bad "jq not found — cannot install the hook. Install jq, then re-run."
+  elif hook_installed; then
+    warn "hook already present in $CT_SETTINGS, leaving as-is"
+  else
+    [ -f "$CT_SETTINGS" ] || echo '{}' >"$CT_SETTINGS"
+    cp "$CT_SETTINGS" "$CT_SETTINGS.bak" && ok "backed up settings to $CT_SETTINGS.bak"
+    local tmp="$CT_SETTINGS.tmp.$$"
+    jq --arg cmd "$CT_BIN hook" '
+      .hooks = (.hooks // {})
+      | .hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{
+          matcher: "Bash",
+          hooks: [{ type: "command", command: $cmd, timeout: 10 }]
+        }])
+    ' "$CT_SETTINGS" >"$tmp" 2>/dev/null \
+      && mv "$tmp" "$CT_SETTINGS" && ok "added PreToolUse hook to $CT_SETTINGS" \
+      || { rm -f "$tmp"; bad "failed to update $CT_SETTINGS"; }
+  fi
+
+  # 4. render + load the watchdog LaunchAgent
+  local tmp="$CT_PLIST.tmp.$$"
+  sed -e "s#__CT_BIN__#$CT_BIN#g" -e "s#__CT_WATCHDOG_LOG__#$CT_WATCHDOG_LOG#g" \
+      "$CT_PLIST_TEMPLATE" >"$tmp" && mv "$tmp" "$CT_PLIST" && ok "wrote $CT_PLIST"
+  launchctl bootout "gui/$(id -u)/$CT_PLIST_LABEL" >/dev/null 2>&1
+  if launchctl bootstrap "gui/$(id -u)" "$CT_PLIST" >/dev/null 2>&1; then
+    ok "watchdog loaded (launchctl bootstrap)"
+  elif launchctl load -w "$CT_PLIST" >/dev/null 2>&1; then
+    ok "watchdog loaded (launchctl load)"
+  else
+    warn "could not load watchdog via launchctl — start manually: claude-throttle watchdog &"
+  fi
+
+  echo
+  do_doctor
+  echo
+  echo "Done. Restart Claude Code so it picks up the new hook."
+}
+
+# ---- uninstall --------------------------------------------------------------
+do_uninstall() {
+  echo "Uninstalling claude-throttle…"
+  # stop watchdog
+  launchctl bootout "gui/$(id -u)/$CT_PLIST_LABEL" >/dev/null 2>&1
+  launchctl unload -w "$CT_PLIST" >/dev/null 2>&1
+  [ -f "$CT_WATCHDOG_PID" ] && kill -TERM "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
+  rm -f "$CT_PLIST" && ok "removed $CT_PLIST"
+
+  # remove hook from settings.json
+  if have jq && [ -f "$CT_SETTINGS" ]; then
+    cp "$CT_SETTINGS" "$CT_SETTINGS.bak"
+    local tmp="$CT_SETTINGS.tmp.$$"
+    jq '
+      if .hooks.PreToolUse then
+        .hooks.PreToolUse |= map(select(
+          (.hooks // []) | any(.command? // "" | test("claude-throttle hook")) | not
+        ))
+        | (if (.hooks.PreToolUse | length) == 0 then del(.hooks.PreToolUse) else . end)
+        | (if (.hooks | length) == 0 then del(.hooks) else . end)
+      else . end
+    ' "$CT_SETTINGS" >"$tmp" 2>/dev/null \
+      && mv "$tmp" "$CT_SETTINGS" && ok "removed hook from $CT_SETTINGS" \
+      || { rm -f "$tmp"; warn "could not edit $CT_SETTINGS"; }
+  fi
+
+  # remove symlink
+  [ -L "$CT_BIN" ] && rm -f "$CT_BIN" && ok "removed $CT_BIN"
+  warn "kept config ($CT_CONFIG_DIR) and logs ($CT_STATE_DIR) — delete manually if desired"
+  echo "Done. Restart Claude Code."
+}
+
+case "$cmd" in
+  doctor)    do_doctor ;;
+  status)    do_status ;;
+  install)   do_install ;;
+  uninstall) do_uninstall ;;
+  help|--help|-h|"")
+    grep -E '^#( |$)' "$_here/claude-throttle" | sed -E 's/^# ?//' | sed -n '1,20p' ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    echo "run 'claude-throttle help' for usage" >&2
+    exit 64 ;;
+esac
