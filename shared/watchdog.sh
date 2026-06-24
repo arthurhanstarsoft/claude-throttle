@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # watchdog.sh — Layer 2 safety net (hook-independent).
 #
-# Continuously watches macOS memory pressure. When free memory drops below the
+# Continuously watches system memory pressure. When free memory drops below the
 # critical threshold (sustained), it SIGSTOPs the heaviest Claude *descendant*
-# processes — pausing is reversible, relieves CPU instantly and lets the VM
+# processes — pausing is reversible, relieves CPU instantly and lets the OS
 # reclaim/compress the paused pages. When memory recovers past the (higher)
 # resume threshold, it SIGCONTs them. This guarantees the machine never hard
 # freezes even when Layer 1 misses a path (e.g. subagent Bash calls).
+# Memory reads, the singleton lock, the exclusion list and file-reversal are
+# provided by the platform module (macos/ or linux/).
 
 set +e
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,18 +18,9 @@ _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ME="$(id -u)"
 
 # ---- singleton guard --------------------------------------------------------
-if command -v shlock >/dev/null 2>&1; then
-  if ! shlock -f "$CT_WATCHDOG_PID" -p $$ >/dev/null 2>&1; then
-    ct_wlog "another watchdog is already running; exiting"
-    exit 0
-  fi
-else
-  # Fallback: trivial pidfile with liveness check.
-  if [ -f "$CT_WATCHDOG_PID" ] && kill -0 "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null; then
-    ct_wlog "another watchdog is already running (pidfile); exiting"
-    exit 0
-  fi
-  echo $$ >"$CT_WATCHDOG_PID"
+if ! ct_singleton_acquire "$CT_WATCHDOG_PID"; then
+  ct_wlog "another watchdog is already running; exiting"
+  exit 0
 fi
 
 # ---- resume everything we ever paused, on any exit --------------------------
@@ -49,15 +42,9 @@ trap 'cleanup; exit 0' EXIT INT TERM
 cont_all_paused
 : >"$CT_PAUSED_LIST" 2>/dev/null
 
-ct_wlog "watchdog started (crit_free=${CT_CRIT_FREE_PCT}% resume_free=${CT_RESUME_FREE_PCT}% interval=${CT_WATCHDOG_INTERVAL}s)"
+ct_wlog "watchdog started os=$CT_OS (crit_free=${CT_CRIT_FREE_PCT}% resume_free=${CT_RESUME_FREE_PCT}% interval=${CT_WATCHDOG_INTERVAL}s)"
 
-# comm names we must never pause even if they show up as descendants.
-ct_excluded_comm() {
-  case "$1" in
-    claude|claude-throttle|*WindowServer*|*loginwindow*|coreaudiod|kernel_task|launchd|*Terminal*|*iTerm*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# ct_excluded_comm (which processes never to pause) is provided by the platform module.
 
 # Echo "rss pid comm" lines for pausable claude descendants, heaviest first.
 ct_pausable_targets() {
@@ -137,7 +124,7 @@ EOF
     if [ "$free" -ge "${CT_RESUME_FREE_PCT:-25}" ]; then
       # Resume in reverse order (last paused first).
       if [ -s "$CT_PAUSED_LIST" ]; then
-        tac_list="$(LC_ALL=C tail -r "$CT_PAUSED_LIST" 2>/dev/null || cat "$CT_PAUSED_LIST")"
+        tac_list="$(ct_reverse "$CT_PAUSED_LIST")"
         while IFS= read -r p; do
           [ -n "$p" ] && { kill -CONT "$p" 2>/dev/null; ct_wlog "RESUMED pid=$p (free=${free}%)"; }
         done <<EOF

@@ -4,18 +4,16 @@
 # Invoked as:  claude-throttle run -- <original command string>
 # Dispatched here with args:  -- <cmd>     (or, internally:  __held <marker> <cmd>)
 #
-# It grabs one of N `lockf` slots and holds it for the ENTIRE lifetime of the
-# command (lockf keeps the lock until its child exits, and auto-releases it if we
-# die for any reason). At most CT_MAX_CONCURRENCY commands run at once; the rest
-# poll until a slot frees or CT_ACQUIRE_TIMEOUT elapses, after which the command
-# runs unthrottled rather than ever blocking Claude forever.
+# It grabs one of N slots via the platform lock (ct_slot_run: lockf on macOS,
+# flock on Linux) and holds it for the ENTIRE lifetime of the command (the lock
+# is released when its child exits, including on crash/kill). At most N commands
+# run at once; the rest poll until a slot frees or CT_ACQUIRE_TIMEOUT elapses,
+# after which the command runs unthrottled rather than ever blocking Claude.
 
 set +e
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$_here/common.sh"
-
-LOCKF="${CT_LOCKF:-/usr/bin/lockf}"
 
 # ---- internal re-entry: we hold the lock, now run the command ----------------
 # Called by lockf as:  wrapper.sh __held <marker> <cmd>
@@ -46,9 +44,9 @@ if [ "${CT_ENABLED:-1}" != "1" ]; then
   exec bash -c "$ORIG"
 fi
 
-# lockf missing -> can't throttle; run unthrottled (fail-open).
-if [ ! -x "$LOCKF" ]; then
-  ct_tlog "RUN lockf missing, running unthrottled: $ORIG"
+# lock tool missing -> can't throttle; run unthrottled (fail-open).
+if ! ct_lock_available; then
+  ct_tlog "RUN lock tool missing, running unthrottled: $ORIG"
   exec bash -c "$ORIG"
 fi
 
@@ -78,9 +76,9 @@ while :; do
     slot="$CT_SLOTS_DIR/slot.$i.lock"
     marker="$CT_SLOTS_DIR/.started.$$.$i"
     rm -f "$marker" 2>/dev/null
-    # -s silent, -t 0 non-blocking. Returns 75 (EX_TEMPFAIL) if the slot is busy;
-    # otherwise returns the command's own exit status.
-    "$LOCKF" -st 0 "$slot" "$self" __held "$marker" "$ORIG"
+    # Non-blocking lock. Busy returns non-zero (75 on macOS lockf, 1 on Linux
+    # flock) — value irrelevant; we detect an actual run via the marker file.
+    ct_slot_run "$slot" "$self" __held "$marker" "$ORIG"
     rc=$?
     if [ -f "$marker" ]; then
       # Our command actually started -> rc is its real exit code.

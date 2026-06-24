@@ -12,12 +12,21 @@ root="$(cd "$here/.." && pwd)"
 
 pstate() { LC_ALL=C ps -o state= -p "$1" 2>/dev/null | cut -c1; }
 
+# Portable ~220 MB memory hog (perl -> python3); SKIP if neither is available.
+if command -v perl >/dev/null 2>&1; then
+  VICTIM='perl -e "\$x = \"A\" x (220*1024*1024); sleep 600;"'
+elif command -v python3 >/dev/null 2>&1; then
+  VICTIM='python3 -c "a=bytearray(220*1024*1024); import time; time.sleep(600)"'
+else
+  echo "watchdog-test: SKIP (no perl or python3 to allocate a victim)"; exit 0
+fi
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/ct-wd.XXXXXX")"
 mkdir -p "$work/state"
 
 # Victim tree: an "anchor" shell whose child holds ~220 MB. The child is the
 # pausable descendant; the anchor itself is excluded (anchors are never paused).
-bash -c 'perl -e "\$x = \"A\" x (220*1024*1024); sleep 600;" & echo $! > "'"$work"'/victim.pid"; wait' &
+bash -c "$VICTIM"' & echo $! > "'"$work"'/victim.pid"; wait' &
 anchor=$!
 # wait for the victim pid file
 for _ in $(seq 1 20); do [ -s "$work/victim.pid" ] && break; sleep 0.2; done

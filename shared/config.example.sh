@@ -1,7 +1,7 @@
 # claude-throttle config — sourced as bash. Copied to
 # ~/.config/claude-throttle/config.sh at install time. Edit values and they take
 # effect on the next command / watchdog tick (no reinstall needed).
-# Anything you delete falls back to the built-in default in libexec/common.sh.
+# Anything you delete falls back to the built-in default in shared/common.sh.
 
 CT_ENABLED=1            # master switch: 0 disables hook, wrapper AND watchdog instantly
 CT_GATE_MODE=heavy      # heavy = only wrap resource-heavy commands; all = wrap every Bash command

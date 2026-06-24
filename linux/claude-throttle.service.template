@@ -1,0 +1,17 @@
+[Unit]
+Description=claude-throttle memory watchdog (Layer 2)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__CT_BIN__ watchdog
+Restart=always
+RestartSec=5
+Nice=10
+# The watchdog also writes its own log via ct_wlog; journal is the most portable
+# target across systemd versions. For a file, use: StandardOutput=append:__CT_WATCHDOG_LOG__
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

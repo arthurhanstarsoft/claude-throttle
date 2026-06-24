@@ -23,7 +23,7 @@ contains() { # contains <name> <needle> <haystack>
 }
 
 echo "metric parsers:"
-. "$root/libexec/common.sh"
+. "$root/shared/common.sh"
 fp="$(ct_free_pct)";  echo "  free_pct=[$fp]";    [ -n "$fp" ] && case "$fp" in (*[!0-9]*) echo "  FAIL: free_pct not integer"; fail=$((fail+1));; (*) pass=$((pass+1));; esac
 l1="$(ct_load1_x100)"; echo "  load1x100=[$l1]";  case "$l1" in (*[!0-9]*) echo "  FAIL: load not integer"; fail=$((fail+1));; ("") echo "  FAIL: load empty"; fail=$((fail+1));; (*) pass=$((pass+1));; esac
 

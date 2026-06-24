@@ -15,7 +15,7 @@
 set +e
 # Resolve our own path through any symlinks (we're symlinked onto PATH at
 # install time, and bash leaves BASH_SOURCE as the symlink). Without this,
-# locating libexec/ relative to the symlink dir (~/.local/bin) would fail.
+# locating shared/ relative to the symlink dir (~/.local/bin) would fail.
 _self="${BASH_SOURCE[0]}"
 while [ -L "$_self" ]; do
   _link="$(readlink "$_self")"
@@ -26,26 +26,30 @@ while [ -L "$_self" ]; do
 done
 _here="$(cd "$(dirname "$_self")" && pwd)"
 CT_ROOT="$(cd "$_here/.." && pwd)"
-LIBEXEC="$CT_ROOT/libexec"
+SHARED="$CT_ROOT/shared"
+
+# Detect OS up front (Windows uses the separate PowerShell port, not this script).
+case "$(uname -s)" in
+  Darwin) CT_OS=macos ;;
+  Linux)  CT_OS=linux ;;
+  *) echo "claude-throttle: unsupported OS '$(uname -s)'. On Windows use windows\\claude-throttle.ps1" >&2; exit 1 ;;
+esac
+export CT_OS
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  hook)     exec bash "$LIBEXEC/hook-pretooluse.sh" "$@" ;;
-  run)      exec bash "$LIBEXEC/wrapper.sh" "$@" ;;
-  watchdog) exec bash "$LIBEXEC/watchdog.sh" "$@" ;;
+  hook)     exec bash "$SHARED/hook-pretooluse.sh" "$@" ;;
+  run)      exec bash "$SHARED/wrapper.sh" "$@" ;;
+  watchdog) exec bash "$SHARED/watchdog.sh" "$@" ;;
 esac
 
-# Non-internal subcommands need the shared helpers.
+# Non-internal subcommands need the shared helpers (which source the platform module).
 # shellcheck source=/dev/null
-. "$LIBEXEC/common.sh"
+. "$SHARED/common.sh"
+# have/ok/bad/warn are defined in shared/common.sh.
 
 # ---- helpers ----------------------------------------------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
-ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
-bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
-warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
-
 watchdog_running() {
   [ -f "$CT_WATCHDOG_PID" ] && kill -0 "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
 }
@@ -59,15 +63,13 @@ hook_installed() {
 # ---- doctor -----------------------------------------------------------------
 do_doctor() {
   echo "claude-throttle doctor"
+  echo "  os:     $CT_OS"
   echo "  root:   $CT_ROOT"
   echo "  config: $CT_CONFIG_FILE"
   echo "  state:  $CT_STATE_DIR"
   echo
   echo "Dependencies:"
-  [ -x /usr/bin/lockf ] && ok "lockf present (/usr/bin/lockf)" || bad "lockf MISSING — semaphore falls back to unthrottled"
-  have jq && ok "jq present" || bad "jq MISSING — hook will fail open (no throttling)"
-  have cpulimit && ok "cpulimit present" || warn "cpulimit absent (optional; \`brew install cpulimit\` to enable CT_USE_CPULIMIT)"
-  have shlock && ok "shlock present" || warn "shlock absent (watchdog uses pidfile fallback)"
+  ct_doctor_platform
   echo
   echo "Configuration:"
   if [ "${CT_DYNAMIC:-1}" = "1" ]; then
@@ -86,7 +88,7 @@ do_doctor() {
   echo "Installation:"
   [ -L "$CT_BIN" ] || [ -x "$CT_BIN" ] && ok "CLI on PATH ($CT_BIN)" || warn "CLI not symlinked to $CT_BIN"
   hook_installed && ok "PreToolUse hook installed in $CT_SETTINGS" || warn "hook NOT installed (run: claude-throttle install)"
-  [ -f "$CT_PLIST" ] && ok "LaunchAgent plist present" || warn "watchdog plist not installed"
+  [ -f "$(ct_service_artifact_path)" ] && ok "$(ct_service_artifact_name) present" || warn "watchdog service not installed"
   watchdog_running && ok "watchdog running (pid $(cat "$CT_WATCHDOG_PID"))" || warn "watchdog not running"
   echo
   echo "Live metrics:"
@@ -117,9 +119,9 @@ do_status() {
 
 # ---- install ----------------------------------------------------------------
 do_install() {
-  echo "Installing claude-throttle…"
+  echo "Installing claude-throttle (os: $CT_OS)…"
   ct_ensure_dirs
-  mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/.claude" 2>/dev/null
+  mkdir -p "$HOME/.local/bin" "$HOME/.claude" 2>/dev/null
 
   # 1. seed config
   if [ ! -f "$CT_CONFIG_FILE" ]; then
@@ -131,19 +133,20 @@ do_install() {
   # 2. copy the tool to a stable, non-TCC-protected location and symlink it.
   #    macOS blocks launchd agents from executing code under ~/Documents etc.,
   #    so we never run from the repo checkout — we run from $CT_INSTALL_DIR.
+  #    Copy only the shared core + the detected OS module (not other platforms).
   if [ "$CT_ROOT" = "$CT_INSTALL_DIR" ]; then
     warn "running from install dir already; refreshing in place"
   else
     rm -rf "$CT_INSTALL_DIR" 2>/dev/null
     mkdir -p "$CT_INSTALL_DIR"
-    cp -R "$CT_ROOT/bin" "$CT_ROOT/libexec" "$CT_ROOT/share" "$CT_INSTALL_DIR/" \
-      && ok "copied tool to $CT_INSTALL_DIR" \
+    cp -R "$CT_ROOT/bin" "$CT_ROOT/shared" "$CT_ROOT/$CT_OS" "$CT_INSTALL_DIR/" \
+      && ok "copied tool to $CT_INSTALL_DIR (bin + shared + $CT_OS)" \
       || bad "failed to copy tool to $CT_INSTALL_DIR"
     # Remember where we were installed from so `claude-throttle update` can
     # re-copy the latest code from your repo, from anywhere.
     printf '%s\n' "$CT_ROOT" >"$CT_STATE_DIR/source_path" 2>/dev/null
   fi
-  chmod +x "$CT_INSTALL_BIN" "$CT_INSTALL_DIR/libexec"/*.sh 2>/dev/null
+  chmod +x "$CT_INSTALL_BIN" "$CT_INSTALL_DIR/shared"/*.sh "$CT_INSTALL_DIR/$CT_OS"/*.sh 2>/dev/null
   ln -sf "$CT_INSTALL_BIN" "$CT_BIN" && ok "symlinked $CT_BIN -> $CT_INSTALL_BIN"
   case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) warn "$HOME/.local/bin is not on your PATH — add it" ;; esac
 
@@ -167,23 +170,9 @@ do_install() {
       || { rm -f "$tmp"; bad "failed to update $CT_SETTINGS"; }
   fi
 
-  # 4. render + load the watchdog LaunchAgent (point it at the installed copy,
-  #    an absolute non-protected path — never the ~/.local/bin symlink or repo).
-  local tmp="$CT_PLIST.tmp.$$"
-  sed -e "s#__CT_BIN__#$CT_INSTALL_BIN#g" -e "s#__CT_WATCHDOG_LOG__#$CT_WATCHDOG_LOG#g" \
-      "$CT_INSTALL_DIR/share/$CT_PLIST_LABEL.plist.template" >"$tmp" \
-      && mv "$tmp" "$CT_PLIST" && ok "wrote $CT_PLIST"
-  # Unload any previous instance, then wait briefly — bootout is asynchronous and
-  # an immediate bootstrap can race it and silently fail to (re)load the job.
-  launchctl bootout "gui/$(id -u)/$CT_PLIST_LABEL" >/dev/null 2>&1
-  sleep 1
-  if launchctl bootstrap "gui/$(id -u)" "$CT_PLIST" >/dev/null 2>&1; then
-    ok "watchdog loaded (launchctl bootstrap)"
-  elif launchctl load -w "$CT_PLIST" >/dev/null 2>&1; then
-    ok "watchdog loaded (launchctl load)"
-  else
-    warn "could not load watchdog via launchctl — start manually: claude-throttle watchdog &"
-  fi
+  # 4. install + start the watchdog service (launchd on macOS, systemd --user on
+  #    Linux), pointed at the installed copy (an absolute, stable path).
+  ct_service_install
   # Confirm it actually came up; report honestly if not.
   sleep 1
   if [ -f "$CT_WATCHDOG_PID" ] && kill -0 "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null; then
@@ -223,12 +212,9 @@ do_update() {
 
 # ---- uninstall --------------------------------------------------------------
 do_uninstall() {
-  echo "Uninstalling claude-throttle…"
-  # stop watchdog
-  launchctl bootout "gui/$(id -u)/$CT_PLIST_LABEL" >/dev/null 2>&1
-  launchctl unload -w "$CT_PLIST" >/dev/null 2>&1
-  [ -f "$CT_WATCHDOG_PID" ] && kill -TERM "$(cat "$CT_WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
-  rm -f "$CT_PLIST" && ok "removed $CT_PLIST"
+  echo "Uninstalling claude-throttle (os: $CT_OS)…"
+  # stop + remove the watchdog service (launchd / systemd --user)
+  ct_service_uninstall
 
   # remove hook from settings.json
   if have jq && [ -f "$CT_SETTINGS" ]; then

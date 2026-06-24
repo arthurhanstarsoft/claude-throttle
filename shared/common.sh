@@ -8,7 +8,7 @@
 # integers only (the host locale may use comma decimals).
 
 # ---- resolve our own install root -------------------------------------------
-# common.sh lives in <root>/libexec/, so <root> is one dir up.
+# common.sh lives in <root>/shared/, so <root> is one dir up.
 _ct_self="${BASH_SOURCE[0]}"
 # Resolve symlinks to find the real file location.
 while [ -L "$_ct_self" ]; do
@@ -18,9 +18,17 @@ while [ -L "$_ct_self" ]; do
     *)  _ct_self="$(cd "$(dirname "$_ct_self")" && pwd)/$_ct_link" ;;
   esac
 done
-CT_LIBEXEC="$(cd "$(dirname "$_ct_self")" && pwd)"
-CT_ROOT="$(cd "$CT_LIBEXEC/.." && pwd)"
+CT_SHARED="$(cd "$(dirname "$_ct_self")" && pwd)"
+CT_ROOT="$(cd "$CT_SHARED/.." && pwd)"
 unset _ct_self _ct_link
+
+# ---- detect OS --------------------------------------------------------------
+# Single detection point used by the dispatcher and the platform module.
+case "$(uname -s)" in
+  Darwin) CT_OS=macos ;;
+  Linux)  CT_OS=linux ;;
+  *)      CT_OS=unknown ;;
+esac
 
 # ---- canonical paths --------------------------------------------------------
 CT_CONFIG_DIR="${CT_CONFIG_DIR:-$HOME/.config/claude-throttle}"
@@ -40,10 +48,9 @@ CT_INSTALL_BIN="$CT_INSTALL_DIR/bin/claude-throttle"
 
 CT_BIN="$HOME/.local/bin/claude-throttle"
 CT_SETTINGS="$HOME/.claude/settings.json"
-CT_PLIST_LABEL="com.user.claude-throttle.watchdog"
-CT_PLIST="$HOME/Library/LaunchAgents/$CT_PLIST_LABEL.plist"
-CT_PLIST_TEMPLATE="$CT_ROOT/share/$CT_PLIST_LABEL.plist.template"
-CT_CONFIG_EXAMPLE="$CT_ROOT/share/config.example.sh"
+CT_CONFIG_EXAMPLE="$CT_ROOT/shared/config.example.sh"
+# Service-manager paths/labels (launchd plist, systemd unit) are defined by the
+# platform module, since they differ per OS.
 
 # ---- defaults ---------------------------------------------------------------
 # `:=` means: keep any value already set in the environment, else use the
@@ -101,38 +108,16 @@ ct_log() {
 ct_tlog() { ct_log "$CT_THROTTLE_LOG" "$@"; }
 ct_wlog() { ct_log "$CT_WATCHDOG_LOG" "$@"; }
 
-# ---- metric parsers (LC_ALL=C, integers only) -------------------------------
-# Free system memory as an integer percentage (0-100). Echoes "" on failure.
-ct_free_pct() {
-  local line pct
-  line="$(LC_ALL=C memory_pressure 2>/dev/null \
-          | grep -i 'free percentage')" || return 0
-  # e.g. "System-wide memory free percentage: 39%"
-  pct="$(printf '%s' "$line" | LC_ALL=C grep -oE '[0-9]+' | tail -n1)"
-  printf '%s' "$pct"
-}
+# ---- small UI helpers (used by the CLI, doctor, and platform service fns) ----
+have() { command -v "$1" >/dev/null 2>&1; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 
-# 1-minute load average scaled x100 as an integer (e.g. 3.27 -> 327).
-# Robust to comma OR dot decimal separators.
-ct_load1_x100() {
-  local raw whole frac
-  raw="$(LC_ALL=C sysctl -n vm.loadavg 2>/dev/null)" || return 0
-  # raw looks like: { 3,27 2,81 4,17 }  or  { 3.27 2.81 4.17 }
-  raw="$(printf '%s' "$raw" | LC_ALL=C tr -d '{}' | LC_ALL=C awk '{print $1}')"
-  whole="$(printf '%s' "$raw" | LC_ALL=C grep -oE '^[0-9]+')"
-  frac="$(printf '%s' "$raw" | LC_ALL=C sed -E 's/^[0-9]+[.,]?//; s/[^0-9].*$//')"
-  [ -z "$whole" ] && return 0
-  frac="${frac}00"; frac="${frac:0:2}"
-  printf '%d' "$((10#$whole * 100 + 10#$frac))"
-}
-
-ct_cores() { LC_ALL=C sysctl -n hw.logicalcpu 2>/dev/null || echo 1; }
-
-# Total physical RAM in MB.
-ct_total_mem_mb() {
-  local b; b="$(LC_ALL=C sysctl -n hw.memsize 2>/dev/null)" || return 0
-  [ -n "$b" ] && printf '%d' "$(( b / 1048576 ))"
-}
+# ---- metrics ----------------------------------------------------------------
+# ct_free_pct, ct_total_mem_mb, ct_load1_x100, ct_cores are OS-specific and live
+# in <os>/platform.sh (sourced at the end of this file). Everything below is
+# OS-agnostic and builds on them.
 
 # Approximate free system memory in MB (free% of total). Echoes "" on failure.
 ct_free_mb() {
@@ -216,3 +201,13 @@ ct_claude_descendants() {
       }
     }'
 }
+
+# ---- load the platform module -----------------------------------------------
+# Provides the OS-specific functions: ct_free_pct, ct_total_mem_mb,
+# ct_load1_x100, ct_cores, ct_slot_run, ct_singleton_acquire, ct_excluded_comm,
+# ct_reverse, ct_service_* and ct_doctor_platform. Sourced last so it may also
+# override any shared default if a platform ever needs to.
+if [ -f "$CT_ROOT/$CT_OS/platform.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$CT_ROOT/$CT_OS/platform.sh"
+fi
